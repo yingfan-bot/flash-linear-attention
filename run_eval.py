@@ -8,10 +8,10 @@ from typing import List
 def parse_args():
    parser = argparse.ArgumentParser(description="Launch RULER experiments")
    parser.add_argument(
-       "model_name", type=str, help="Model namåe to use"
+       "--model_name", type=str, help="Model namåe to use"
    )
    parser.add_argument(
-       "path", type=str, help="Model path to use"
+       "--path", type=str, help="Model path to use"
    )
    parser.add_argument(
        "--niah_single_1", action="store_true", help="Run niah_single_1 task"
