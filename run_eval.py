@@ -116,7 +116,7 @@ def main():
    # Run experiments
    for task in tasks:
        for length in lengths:
-           run_experiment(args.model_name, task, arg.path, length, args.device)
+           run_experiment(args.model_name, task, args.path, length, args.device)
 
 
 if __name__ == "__main__":
