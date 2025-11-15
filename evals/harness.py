@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """
 Harness entry for lm-eval.
-- Robustly imports your sibling repo `scale_ttt/custom_models/...`
+- Robustly imports your sibling repo `repo/custom_models/...`
 - Optionally imports specific submodules (sba, lact_model)
 - Registers a lightweight --model fla wrapper (HuggingFace HFLM-based)
 Run example:
@@ -18,15 +18,15 @@ import pkgutil
 def _maybe_import_custom_models() -> None:
     """
     Ensure we can import your custom models located at:
-        <parent_dir>/scale_ttt/custom_models/...
+        <parent_dir>/repo/custom_models/...
 
     We try both import paths:
-      1)  import custom_models               (requires sys.path contains /.../scale_ttt)
-      2)  import scale_ttt.custom_models     (requires sys.path contains /.../)
+      1)  import custom_models               (requires sys.path contains /.../repo)
+      2)  import repo.custom_models     (requires sys.path contains /.../)
 
     Precedence of search roots:
-      - FLAME_PATH env var (should point to /abs/path/to/scale_ttt)
-      - sibling repo guess: <repo_root>/../scale_ttt
+      - FLAME_PATH env var (should point to /abs/path/to/repo)
+      - sibling repo guess: <repo_root>/../repo
       - fallback guesses if you move things around
 
     On success we also alias to 'custom_models' in sys.modules so that
@@ -39,13 +39,13 @@ def _maybe_import_custom_models() -> None:
     candidates = []
     # 1) explicit env var
     if os.environ.get("FLAME_PATH"):
-        candidates.append(os.environ["FLAME_PATH"])  # expected to be .../scale_ttt
+        candidates.append(os.environ["FLAME_PATH"])  # expected to be .../repo
 
-    # 2) sibling repo guess: flash-linear-attention and scale_ttt are siblings
-    candidates.append(os.path.join(parent_of_repo, "scale_ttt"))
+    # 2) sibling repo guess: flash-linear-attention and repo are siblings
+    candidates.append(os.path.join(parent_of_repo, "repo"))
 
     # 3) repo-internal guess (if someday you vendor it inside)
-    candidates.append(os.path.join(repo_root, "scale_ttt"))
+    candidates.append(os.path.join(repo_root, "repo"))
 
     # Add candidates to sys.path (if they exist)
     for p in candidates:
@@ -55,20 +55,20 @@ def _maybe_import_custom_models() -> None:
     cm_module = None
     errs = []
 
-    # Try plain 'custom_models' (works if sys.path contains /.../scale_ttt)
+    # Try plain 'custom_models' (works if sys.path contains /.../repo)
     try:
         cm_module = importlib.import_module("custom_models")
     except Exception as e:
         errs.append(f"import custom_models -> {e!r}")
 
-    # Fallback: 'scale_ttt.custom_models' (works if sys.path contains the parent)
+    # Fallback: 'repo.custom_models' (works if sys.path contains the parent)
     if cm_module is None:
         try:
-            cm_module = importlib.import_module("scale_ttt.custom_models")
+            cm_module = importlib.import_module("repo.custom_models")
             # alias so that 'import custom_models' also works
             sys.modules.setdefault("custom_models", cm_module)
         except Exception as e:
-            errs.append(f"import scale_ttt.custom_models -> {e!r}")
+            errs.append(f"import repo.custom_models -> {e!r}")
 
     if cm_module is None:
         print(f"[harness] warn: cannot load custom_models: {' | '.join(errs)}", flush=True)
@@ -76,7 +76,7 @@ def _maybe_import_custom_models() -> None:
 
     # Optional explicit submodules you asked for (ignore if missing)
     for mod in ("custom_models.sba", "custom_models.lact_model",
-                "scale_ttt.custom_models.sba", "scale_ttt.custom_models.lact_model"):
+                "repo.custom_models.sba", "repo.custom_models.lact_model"):
         try:
             importlib.import_module(mod)
         except ModuleNotFoundError:
