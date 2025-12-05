@@ -66,7 +66,7 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
        "--tasks",
        task_name,
        "--model_args",
-       f"pretrained={path},use_cache=False,dtype=bfloat16,max_length=32768,trust_remote_code=True",
+       f"pretrained={path},use_cache=False,dtype=bfloat16,max_length={length},trust_remote_code=True",
        "--metadata",
        f'{{"max_seq_lengths":[{length}]}}',
        "--batch_size",
