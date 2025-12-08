@@ -39,11 +39,14 @@ def parse_args():
    parser.add_argument(
        "--device", type=int, default=0, help="Device to run the experiment on"
    )
+   parser.add_argument(
+       "--use_cache", action="store_true", help="Enable model caching"
+   )
 
    return parser.parse_args()
 
 
-def run_experiment(model_name: str, task_name: str, path: str, length: int, device: int):
+def run_experiment(model_name: str, task_name: str, path: str, length: int, device: int, use_cache: bool):
   
    output_dir = f"../RULER/{model_name}/{task_name}"
 
@@ -66,7 +69,7 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
        "--tasks",
        task_name,
        "--model_args",
-       f"pretrained={path},use_cache=False,dtype=bfloat16,max_length={length},trust_remote_code=True",
+       f"pretrained={path},use_cache={use_cache},dtype=bfloat16,max_length={length},trust_remote_code=True",
        "--metadata",
        f'{{"max_seq_lengths":[{length}]}}',
        "--batch_size",
@@ -116,7 +119,7 @@ def main():
    # Run experiments
    for task in tasks:
        for length in lengths:
-           run_experiment(args.model_name, task, args.path, length, args.device)
+           run_experiment(args.model_name, task, args.path, length, args.device, args.use_cache)
 
 
 if __name__ == "__main__":
