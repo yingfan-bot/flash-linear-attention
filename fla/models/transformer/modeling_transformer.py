@@ -4,6 +4,9 @@ from __future__ import annotations
 import math
 import warnings
 from typing import TYPE_CHECKING, Any
+import time
+import os
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -29,6 +32,19 @@ except ImportError:
     from fla.models.modeling_layers import GradientCheckpointingLayer
 
 logger = logging.get_logger(__name__)
+
+# Timing log file setup
+log_dir = os.path.expanduser("~/timing_logs")
+os.makedirs(log_dir, exist_ok=True)
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = os.path.join(log_dir, f"timing_{timestamp}.log")
+
+def _log_timing(message, color_code=93):
+    """Helper to log timing with color. Color codes: 96=cyan (model-level), 93=yellow (layer-level), 92=green (attention), 95=magenta (MLP)"""
+    colored_msg = f"\033[{color_code}m{message}\033[0m"
+    print(colored_msg)
+    with open(log_file, "a") as f:
+        f.write(colored_msg + "\n")
 
 
 class TransformerBlock(GradientCheckpointingLayer):
@@ -70,9 +86,14 @@ class TransformerBlock(GradientCheckpointingLayer):
         use_cache: bool | None = False,
         **kwargs: Unpack[Any],
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
-
+        t0 = time.perf_counter()
+        
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
+        
+        t1 = time.perf_counter()
+        torch.cuda.synchronize()
+        
         hidden_states, attentions, past_key_values = self.attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -81,14 +102,28 @@ class TransformerBlock(GradientCheckpointingLayer):
             output_attentions=output_attentions,
             **kwargs,
         )
+        
+        t2 = time.perf_counter()
+        torch.cuda.synchronize()
+        _log_timing(f"[Timing Layer {self.layer_idx}] Flash Attention: {(t2-t1)*1000:.2f} ms", color_code=92)
+        
         if self.config.fuse_norm:
             hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
         else:
             hidden_states = residual + hidden_states
             residual = hidden_states
             hidden_states = self.mlp_norm(hidden_states)
+        
+        t3 = time.perf_counter()
+        torch.cuda.synchronize()
+        
         hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
+        
+        t4 = time.perf_counter()
+        torch.cuda.synchronize()
+        _log_timing(f"[Timing Layer {self.layer_idx}] MLP (SwiGLU): {(t4-t3)*1000:.2f} ms", color_code=95)
+        _log_timing(f"[Timing Layer {self.layer_idx}] Total layer time: {(t4-t0)*1000:.2f} ms", color_code=93)
 
         outputs = (hidden_states,)
 
@@ -307,6 +342,8 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        t0 = time.perf_counter()
+        
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -319,9 +356,17 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
             **kwargs,
         )
 
+        t1 = time.perf_counter()
+        torch.cuda.synchronize()
+        _log_timing(f"[Timing Model] Model forward (all layers): {(t1-t0)*1000:.2f} ms", color_code=96)
+        
         hidden_states = outputs[0]
 
+        t2 = time.perf_counter()
         logits = None if self.config.fuse_linear_cross_entropy else self.lm_head(hidden_states[:, -logits_to_keep:])
+        t3 = time.perf_counter()
+        torch.cuda.synchronize()
+        _log_timing(f"[Timing Model] LM head: {(t3-t2)*1000:.2f} ms", color_code=96)
 
         loss = None
         if labels is not None:
@@ -337,11 +382,15 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
             # Enable model parallelism
             labels = labels.to(hidden_states.device)
             labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
+            t4 = time.perf_counter()
             if self.config.fuse_linear_cross_entropy:
                 loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
+            t5 = time.perf_counter()
+            torch.cuda.synchronize()
+            _log_timing(f"[Timing Model] Loss computation: {(t5-t4)*1000:.2f} ms", color_code=96)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

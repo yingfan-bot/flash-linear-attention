@@ -1,4 +1,12 @@
-#!/usr/bin/env python3
+# import debugpy
+
+# # Start the debug server
+# debugpy.listen(("localhost", 5678))
+# print("✅ Waiting for debugger attach on port 5678...")
+# debugpy.wait_for_client()  # Pause here until debugger is attached
+
+# # Your actual app code below
+# print("🚀 Debugger attached! Running the app...")
 
 import argparse
 import subprocess
