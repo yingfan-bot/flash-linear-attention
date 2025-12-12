@@ -1,12 +1,12 @@
-# import debugpy
+import debugpy
 
-# # Start the debug server
-# debugpy.listen(("localhost", 5678))
-# print("✅ Waiting for debugger attach on port 5678...")
-# debugpy.wait_for_client()  # Pause here until debugger is attached
+# Start the debug server
+debugpy.listen(("localhost", 5678))
+print("✅ Waiting for debugger attach on port 5678...")
+debugpy.wait_for_client()  # Pause here until debugger is attached
 
-# # Your actual app code below
-# print("🚀 Debugger attached! Running the app...")
+# Your actual app code below
+print("🚀 Debugger attached! Running the app...")
 
 import argparse
 import subprocess
@@ -92,7 +92,32 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
 
    # Run the command
    print(f"Running experiment for {model_name} on {task_name} with length {length}")
-   subprocess.run(cmd, env=env)
+   
+   # --- DEBUGGING MODIFICATION ---
+   # Instead of subprocess.run(cmd, env=env), we run in-process so the debugger works.
+   import sys
+   # Ensure the current directory is in sys.path so we can import evals.harness
+   if os.getcwd() not in sys.path:
+       sys.path.append(os.getcwd())
+   
+   from evals.harness import cli_evaluate
+
+   # Construct sys.argv for lm_eval
+   sys.argv = [
+       "evals.harness",
+       "--output_path", output_dir,
+       "--tasks", task_name,
+       "--model_args", f"pretrained={path},use_cache={use_cache},dtype=bfloat16,max_length={length},trust_remote_code=True",
+       "--metadata", f'{{"max_seq_lengths":[{length}]}}',
+       "--batch_size", "1",
+       "--show_config",
+       "--trust_remote_code",
+   ]
+   
+   print(f"🚀 Debug Mode: Running in-process with args: {sys.argv}")
+   cli_evaluate()
+   # subprocess.run(cmd, env=env)
+   # -----------------------------
 
 
 def main():
