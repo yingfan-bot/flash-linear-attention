@@ -363,10 +363,13 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        use_cache: bool = True,
+        use_cache: Optional[bool] = None,
         logits_to_keep: Optional[int] = None,
         **kwargs
     ):
+        # Default to config value if not specified
+        if use_cache is None:
+            use_cache = self.config.use_cache
         # print("DEBUG:", input_ids.shape, "prepare_inputs_for_generation called")
         # only last token for `inputs_ids` if the `past_key_values` is not empty.
         if past_key_values is not None and use_cache:
@@ -379,17 +382,22 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
                 # Check first layer to see if it has content
                 first_layer = past_key_values[0]
                 if isinstance(first_layer, (list, tuple)) and len(first_layer) > 0:
-                    # (k, v)
-                    if hasattr(first_layer[0], 'shape') and first_layer[0].shape[-2] > 0:
+                    # Our tuple cache: (k_cache, v_cache, ...) - k_cache shape is [batch, seq, heads, dim]
+                    # Use numel() > 0 to check if tensor has content
+                    if hasattr(first_layer[0], 'numel') and first_layer[0].numel() > 0:
                         has_content = True
+                        # print(f"DEBUG prepare_inputs: k_cache.shape={first_layer[0].shape}, numel={first_layer[0].numel()}, has_content=True")
+                    # else:
+                    #     print(f"DEBUG prepare_inputs: first_layer[0] has numel=0 or no numel attr, has_content=False")
                 elif isinstance(first_layer, torch.Tensor):
-                    if first_layer.shape[-2] > 0:
+                    if first_layer.numel() > 0:
                         has_content = True
+                        # print(f"DEBUG prepare_inputs: first_layer tensor shape={first_layer.shape}, numel={first_layer.numel()}, has_content=True")
             
-            # print(f"DEBUG: prepare_inputs_for_generation - type(pkv)={type(past_key_values)}, has_content={has_content}")
-            
+            # print(f"DEBUG prepare_inputs: input_ids.shape={input_ids.shape}, has_content={has_content}")
             if has_content:
                 input_ids = input_ids[:, -1:]
+                # print(f"DEBUG prepare_inputs: after slice input_ids.shape={input_ids.shape}")
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and (past_key_values is None or len(past_key_values) == 0):

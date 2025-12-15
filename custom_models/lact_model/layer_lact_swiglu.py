@@ -291,6 +291,7 @@ class LaCTSWIGLULayer(nn.Module):
         # --- 1. STATE UNPACKING ---
         is_decoding = False
         pending_count = 0
+        seen_tokens = 0  # Track actual sequence position for RoPE (not truncated)
         fast_k_buf, fast_v_buf, lr0_buf, lr1_buf, lr2_buf = None, None, None, None, None
         past_key, past_value = None, None
         
@@ -325,19 +326,19 @@ class LaCTSWIGLULayer(nn.Module):
                  count_t = past_key_values[5]
                  pending_count = count_t.item()
                  
-                 if len(past_key_values) > 6:
-                     fast_k_buf = past_key_values[6]
-                     fast_v_buf = past_key_values[7]
-                     lr0_buf = past_key_values[8]
-                     lr1_buf = past_key_values[9]
-                     lr2_buf = past_key_values[10]
+                 fast_k_buf = past_key_values[6]
+                 fast_v_buf = past_key_values[7]
+                 lr0_buf = past_key_values[8]
+                 lr1_buf = past_key_values[9]
+                 lr2_buf = past_key_values[10]
+                 seen_tokens = past_key_values[11].item()
                  
                  is_decoding = True
         else:
             # PREFILL: cache is None or empty
             pending_count = q_len % self.lact_chunk_size
             is_decoding = False
-
+        
         q, k, v = self.qkv(hidden_states).chunk(3, dim=-1)
         #### compute window attention first, then do ttt. ####
 
@@ -356,12 +357,7 @@ class LaCTSWIGLULayer(nn.Module):
         # WARNING: current implementation ignores cu_seqlens for ttt-layer. 
         cu_seqlens = kwargs.get('cu_seqlens', None)
 
-        seqlen_offset, max_seqlen = 0, q_len
-        if past_key_values is not None and not isinstance(past_key_values, tuple):
-             seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-        elif is_decoding:
-             seqlen_offset = past_key.shape[1]
-        
+        seqlen_offset = seen_tokens  # Always use seen_tokens (0 for prefill, actual position for decoding)
         max_seqlen = q.shape[1] + seqlen_offset
         if attention_mask is not None:
              # to deliminate the offsets of padding tokens
@@ -491,12 +487,11 @@ class LaCTSWIGLULayer(nn.Module):
         
         if not is_decoding:
             # PREFILL
-            # print(f"DEBUG: PREFILL layer_idx={self.layer_idx}, q_len={q_len}")
             if self.num_slices >= 1:
                 # ... (CSDM logic) ...
                 # Note: CSDM doesn't support return_final_state yet in my edits, but I'll assume it does or fallback
                 # If use_cache is True, we need final state.
-                # I will use the standard block if use_cache is True to avoid CSDM issues for now?
+                # I will use the stan. ard block if use_cache is True to avoid CSDM issues for now?
                 # Or just call it and hope.
                 # The user didn't ask to fix CSDM.
                 # I'll stick to the existing logic structure.
@@ -564,6 +559,15 @@ class LaCTSWIGLULayer(nn.Module):
                 if isinstance(fw_x, tuple):
                     fw_x, final_state = fw_x
                     cur_w0, cur_w1, cur_w2 = final_state
+                
+                # Save the remainder tokens (last pending_count tokens) to buffers for future TTT updates
+                # These are the tokens in the "last chunk" that didn't get used for weight updates
+                if pending_count > 0:
+                    fast_k_buf = fast_k[:, -pending_count:, :]
+                    fast_v_buf = fast_v[:, -pending_count:, :]
+                    lr0_buf = fw_lr1[:, -pending_count:, :]
+                    lr1_buf = fw_lr2[:, -pending_count:, :]
+                    lr2_buf = fw_lr3[:, -pending_count:, :]
         else:
             # DECODING
             fw_x = ttt_apply_weights_only(fast_q, cur_w0, cur_w1, cur_w2)
@@ -626,7 +630,9 @@ class LaCTSWIGLULayer(nn.Module):
 
         next_cache = None
         if use_cache:
-             next_cache = (k_cache, v_cache, cur_w0, cur_w1, cur_w2, torch.tensor([pending_count], device=k.device), fast_k_buf, fast_v_buf, lr0_buf, lr1_buf, lr2_buf)
+             # Track actual sequence position for correct RoPE in future decoding
+             new_seen_tokens = seen_tokens + q_len if is_decoding else q_len
+             next_cache = (k_cache, v_cache, cur_w0, cur_w1, cur_w2, torch.tensor([pending_count], device=k.device), fast_k_buf, fast_v_buf, lr0_buf, lr1_buf, lr2_buf, torch.tensor([new_seen_tokens], device=k.device))
 
         return o, attentions, next_cache
 
