@@ -251,8 +251,8 @@ class LaCTModel(LaCTPreTrainedModel):
         elif input_ids is None and inputs_embeds is None:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if use_cache and not isinstance(past_key_values, Cache):
-            past_key_values = Cache.from_legacy_cache(past_key_values)
+        # if use_cache and not isinstance(past_key_values, Cache):
+        #     past_key_values = Cache.from_legacy_cache(past_key_values)
 
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
@@ -271,16 +271,18 @@ class LaCTModel(LaCTPreTrainedModel):
         all_attns = () if output_attentions else None
         next_cache = None
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            past_key_value = past_key_values[i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     layer.__call__,
                     hidden_states,
                     attention_mask,
-                    past_key_values,
+                    past_key_value,
                     output_attentions,
                     use_cache,
                     **kwargs
@@ -289,7 +291,7 @@ class LaCTModel(LaCTPreTrainedModel):
                 layer_outputs = layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    past_key_values=past_key_values,
+                    past_key_values=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     **kwargs
@@ -298,7 +300,9 @@ class LaCTModel(LaCTPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_cache = layer_outputs[2 if output_attentions else 1]
+                if next_cache is None:
+                    next_cache = ()
+                next_cache += (layer_outputs[2 if output_attentions else 1],)
 
             if output_attentions:
                 all_attns += (layer_outputs[1],)
@@ -363,12 +367,32 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         logits_to_keep: Optional[int] = None,
         **kwargs
     ):
-        use_cache = False
+        # print("DEBUG:", input_ids.shape, "prepare_inputs_for_generation called")
         # only last token for `inputs_ids` if the `past_key_values` is not empty.
-        if past_key_values is not None and len(past_key_values) > 0 and use_cache:
-            input_ids = input_ids[:, -1:]
+        if past_key_values is not None and use_cache:
+            # Check if the cache actually has content. 
+            has_content = False
+            if hasattr(past_key_values, "get_seq_length"):
+                if past_key_values.get_seq_length() > 0:
+                    has_content = True
+            elif isinstance(past_key_values, (list, tuple)) and len(past_key_values) > 0:
+                # Check first layer to see if it has content
+                first_layer = past_key_values[0]
+                if isinstance(first_layer, (list, tuple)) and len(first_layer) > 0:
+                    # (k, v)
+                    if hasattr(first_layer[0], 'shape') and first_layer[0].shape[-2] > 0:
+                        has_content = True
+                elif isinstance(first_layer, torch.Tensor):
+                    if first_layer.shape[-2] > 0:
+                        has_content = True
+            
+            # print(f"DEBUG: prepare_inputs_for_generation - type(pkv)={type(past_key_values)}, has_content={has_content}")
+            
+            if has_content:
+                input_ids = input_ids[:, -1:]
+
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and len(past_key_values) == 0:
+        if inputs_embeds is not None and (past_key_values is None or len(past_key_values) == 0):
             model_inputs = {'inputs_embeds': inputs_embeds}
         else:
             # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
@@ -381,7 +405,7 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
             model_inputs['logits_to_keep'] = logits_to_keep
 
         model_inputs.update({
-            'past_key_values': None, # past_key_values,
+            'past_key_values': past_key_values,
             'use_cache': use_cache,
             'attention_mask': attention_mask,
         })
@@ -402,7 +426,6 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         logits_to_keep: Optional[int] = 0,
         **kwargs: Unpack[Any]
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        use_cache = False
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

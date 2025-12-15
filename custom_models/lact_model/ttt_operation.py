@@ -80,6 +80,7 @@ def block_causal_lact_swiglu(
     chunk_size: int=2048,  # test-time training chunk size
     use_muon: bool = False,
     momentum: torch.Tensor = None, # [b, s, 1]
+    return_final_state: bool = False,
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -213,6 +214,8 @@ def block_causal_lact_swiglu(
     # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
     output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
+    if return_final_state:
+        return output.transpose(1, 2), (w0, w1, w2)
     return output.transpose(1, 2)
 
 
@@ -230,6 +233,7 @@ def prenorm_block_causal_lact_swiglu(
     chunk_size: int=2048,  # test-time training chunk size
     use_muon: bool = False,
     momentum: torch.Tensor = None, # [b, s, 1]
+    return_final_state: bool = False,
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -353,18 +357,73 @@ def prenorm_block_causal_lact_swiglu(
         w1 = w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
         w2 = w2_main / (w2_main.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
         
+        # Update local vars for next iteration
+        w0, w1, w2 = w0_main, w1_main, w2_main
+
     # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
     s_index = e_index
     e_index = seq_len
 
-    qi = q[:, :, s_index:e_index]
-    # use the last w0 and w1 to get the final output
-    # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-    h = torch.bmm(w2, qi)
-    gate = F.silu(torch.bmm(w0, qi), inplace=True)
-    # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
-    output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
+    if s_index < e_index:
+        qi = q[:, :, s_index:e_index]
+        # use the last w0 and w1 to get the final output
+        # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
+        h = torch.bmm(w2, qi)
+        gate = F.silu(torch.bmm(w0, qi), inplace=True)
+        # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
+        output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
 
+        if return_final_state:
+            ki = k[:, s_index:e_index, :]
+            vi = v[:, :, s_index:e_index]
+            lr1i = lr1[:, s_index:e_index, :]
+            lr2i = lr2[:, s_index:e_index, :]
+            lr0i = lr0[:, s_index:e_index, :]
+
+            gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
+            hidden_before_mul = torch.bmm(w2, ki.transpose(1, 2))
+
+            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+            
+            dhidden = torch.bmm(w1.transpose(1, 2), vi)
+
+            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+
+            dgate = dhidden * hidden_before_mul
+            dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+            dw1 = torch.bmm(
+                vi, (hidden.transpose(1, 2) * lr1i).type_as(vi)
+            )
+            dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act))
+            dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul))
+
+            if momentum is not None:
+                m_i = momentum[:, s_index:e_index, :] 
+                m_i = m_i.mean(dim=1, keepdim=True)
+
+                dw0 = dw0 + dw0_momentum * m_i
+                dw1 = dw1 + dw1_momentum * m_i
+                dw2 = dw2 + dw2_momentum * m_i
+                dw0_momentum = dw0
+                dw1_momentum = dw1
+                dw2_momentum = dw2
+
+            if use_muon:
+                dw1 = zeropower_via_newtonschulz5(dw1)
+                dw0 = zeropower_via_newtonschulz5(dw0)
+                dw2 = zeropower_via_newtonschulz5(dw2)
+
+            w1_main = w1_main + dw1
+            w0_main = w0_main + dw0
+            w2_main = w2_main + dw2
+        
+            w0 = w0_main / (w0_main.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
+            w1 = w1_main / (w1_main.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
+            w2 = w2_main / (w2_main.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+
+    if return_final_state:
+        return output.transpose(1, 2), (w0, w1, w2)
     return output.transpose(1, 2)
 
 
@@ -741,3 +800,59 @@ def block_causal_lact_swiglu_csdm_vec(
         out[:, :, s_index:e_index] = y
 
     return out.transpose(1, 2)
+
+def ttt_apply_weights_only(q, w0, w1, w2):
+    """
+    O(1) Step: Applies current W to input q without any loop.
+    q: [B, 1, dk]
+    w0, w2: [B, dh, dk]
+    w1: [B, dv, dh]
+    """
+    q_t = q.transpose(1, 2) # [B, dk, 1]
+    h = torch.bmm(w2, q_t)
+    gate = F.silu(torch.bmm(w0, q_t))
+    out = torch.bmm(w1, gate * h)
+    return out.transpose(1, 2) # [B, 1, dv]
+
+def ttt_update_step_isolated(k, v, w0, w1, w2, lr0, lr1, lr2, w0_init_norm, w1_init_norm, w2_init_norm, use_muon=False):
+    """
+    O(1) Step: Takes exactly one chunk, runs update, returns NEW W.
+    k: [B, chunk, dk]
+    v: [B, chunk, dv]
+    lr: [B, chunk, 1]
+    """
+    ki = k
+    vi = v.transpose(1, 2) # [B, dv, chunk]
+    
+    gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
+    hidden_before_mul = torch.bmm(w2, ki.transpose(1, 2))
+
+    hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+    
+    dhidden = torch.bmm(w1.transpose(1, 2), vi)
+
+    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+
+    dgate = dhidden * hidden_before_mul
+    dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+    dw1 = torch.bmm(
+        vi, (hidden.transpose(1, 2) * lr1).type_as(vi)
+    )
+    dw0 = torch.bmm(dgate_before_act, (ki * lr0).type_as(dgate_before_act))
+    dw2 = torch.bmm(dhidden_before_mul, (ki * lr2).type_as(dhidden_before_mul))
+
+    if use_muon:
+        dw1 = zeropower_via_newtonschulz5(dw1)
+        dw0 = zeropower_via_newtonschulz5(dw0)
+        dw2 = zeropower_via_newtonschulz5(dw2)
+
+    w1 = w1 + dw1
+    w0 = w0 + dw0
+    w2 = w2 + dw2
+    
+    w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_init_norm
+    w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_init_norm
+    w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_init_norm
+    
+    return w0, w1, w2
