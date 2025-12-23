@@ -76,7 +76,7 @@ class LowRankFastWeight(nn.Module):
         self.w_right = nn.Parameter(torch.randn(num_heads, rank, in_features))
         self.init_gain = init_gain
 
-        print("init low rank fast weight", num_heads, out_features, in_features, rank)
+        # print("init low rank fast weight", num_heads, out_features, in_features, rank)
 
     def _init_weights(self):
         
@@ -274,9 +274,12 @@ class LaCTSWIGLULayer(nn.Module):
         past_key_values: Optional[Union[Cache, Tuple]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        is_chunked_prefill: bool = False,  # Flag to force prefill path even with cache
+        is_last_chunk: bool = True,  # For chunked prefill: don't update weights on last chunk
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         batch_size, q_len, _ = hidden_states.size()
+        
         # print(f"DEBUG: layer_idx={self.layer_idx}, q_len={q_len}, use_cache={use_cache}, is_decoding={past_key_values is not None}, window_size={self.window_size}")
         
         if attention_mask is not None:
@@ -315,7 +318,13 @@ class LaCTSWIGLULayer(nn.Module):
                 # DynamicCache or similar
                 has_cache_content = past_key_values.get_seq_length(self.layer_idx) > 0
         
-        if has_cache_content:
+        # For chunked prefill, treat as prefill even if cache has content
+        if is_chunked_prefill:
+            has_cache_content_for_decode = False
+        else:
+            has_cache_content_for_decode = has_cache_content
+        
+        if has_cache_content_for_decode:
             # DECODING: Unpack the populated cache
             if isinstance(past_key_values, tuple) and len(past_key_values) >= 6:
                  past_key = past_key_values[0]
@@ -334,6 +343,25 @@ class LaCTSWIGLULayer(nn.Module):
                  seen_tokens = past_key_values[11].item()
                  
                  is_decoding = True
+        elif has_cache_content and is_chunked_prefill:
+            # CHUNKED PREFILL: Unpack cache for TTT weights, but use prefill path
+            if isinstance(past_key_values, tuple) and len(past_key_values) >= 6:
+                 past_key = past_key_values[0]
+                 past_value = past_key_values[1]
+                 cur_w0 = past_key_values[2]
+                 cur_w1 = past_key_values[3]
+                 cur_w2 = past_key_values[4]
+                 count_t = past_key_values[5]
+                 pending_count = count_t.item()
+                 
+                 fast_k_buf = past_key_values[6]
+                 fast_v_buf = past_key_values[7]
+                 lr0_buf = past_key_values[8]
+                 lr1_buf = past_key_values[9]
+                 lr2_buf = past_key_values[10]
+                 seen_tokens = past_key_values[11].item()
+                 
+                 is_decoding = False  # Still use prefill path for TTT
         else:
             # PREFILL: cache is None or empty
             pending_count = q_len % self.lact_chunk_size
@@ -379,10 +407,15 @@ class LaCTSWIGLULayer(nn.Module):
                     # print(f"DEBUG: past_key.shape={past_key.shape}, k.shape={k.shape}")
                     k = torch.cat((past_key, k), dim=1)
                     v = torch.cat((past_value, v), dim=1)
-                    # Only truncate to window when we have past content (decoding)
-                    if self.window_size is not None and k.shape[1] > self.window_size:
-                        k = k[:, -self.window_size:, :]
-                        v = v[:, -self.window_size:, :]
+                    # For chunked prefill: keep window_size + q_len for boundary attention
+                    # For decoding: truncate to window_size
+                    if self.window_size is not None:
+                        if is_chunked_prefill and k.shape[1] > self.window_size + q_len:
+                            k = k[:, -(self.window_size + q_len):, :]
+                            v = v[:, -(self.window_size + q_len):, :]
+                        elif not is_chunked_prefill and k.shape[1] > self.window_size:
+                            k = k[:, -self.window_size:, :]
+                            v = v[:, -self.window_size:, :]
             else:
                 cache_has_content = past_key_values.get_seq_length(self.layer_idx) > 0
                 k_cached, v_cached = past_key_values.update(
@@ -399,8 +432,14 @@ class LaCTSWIGLULayer(nn.Module):
         if flash_attn_func is None:
             raise ImportError("Please install Flash Attention via `pip install flash-attn --no-build-isolation` first")
 
-        k_cache = k
-        v_cache = v
+        # Truncate k/v to window_size for cache storage (saves memory for long sequences)
+        # Use .clone() to guarantee independent copy, allowing original tensor to be freed
+        if self.window_size is not None and k.shape[1] > self.window_size:
+            k_cache = k[:, -self.window_size:, :].clone()
+            v_cache = v[:, -self.window_size:, :].clone()
+        else:
+            k_cache = k.clone()
+            v_cache = v.clone()
 
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
@@ -560,14 +599,87 @@ class LaCTSWIGLULayer(nn.Module):
                     fw_x, final_state = fw_x
                     cur_w0, cur_w1, cur_w2 = final_state
                 
-                # Save the remainder tokens (last pending_count tokens) to buffers for future TTT updates
-                # These are the tokens in the "last chunk" that didn't get used for weight updates
-                if pending_count > 0:
-                    fast_k_buf = fast_k[:, -pending_count:, :]
-                    fast_v_buf = fast_v[:, -pending_count:, :]
-                    lr0_buf = fw_lr1[:, -pending_count:, :]
-                    lr1_buf = fw_lr2[:, -pending_count:, :]
-                    lr2_buf = fw_lr3[:, -pending_count:, :]
+                # For chunked prefill: accumulate tokens in buffer, update weights when we have a full chunk
+                # For last chunk: buffer only the remainder tokens (matching non-chunked behavior)
+                
+                if is_chunked_prefill:
+                    if not is_last_chunk:
+                        # Only buffer tokens from non-last chunks
+                        if fast_k_buf is None:
+                            fast_k_buf = fast_k
+                            fast_v_buf = fast_v
+                            lr0_buf = fw_lr1
+                            lr1_buf = fw_lr2
+                            lr2_buf = fw_lr3
+                        else:
+                            fast_k_buf = torch.cat((fast_k_buf, fast_k), dim=1)
+                            fast_v_buf = torch.cat((fast_v_buf, fast_v), dim=1)
+                            lr0_buf = torch.cat((lr0_buf, fw_lr1), dim=1)
+                            lr1_buf = torch.cat((lr1_buf, fw_lr2), dim=1)
+                            lr2_buf = torch.cat((lr2_buf, fw_lr3), dim=1)
+                        
+                        pending_count = pending_count + q_len
+                        
+                        # Update weights when we have a full chunk
+                        if pending_count >= self.lact_chunk_size:
+                            if self.w0_w2_low_rank > 0:
+                                w0_norm = self.w0().norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                                w2_norm = self.w2().norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                            else:
+                                w0_norm = self.w0.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                                w2_norm = self.w2.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                            w1_norm = self.w1.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                            
+                            chunk_k = fast_k_buf[:, :self.lact_chunk_size, :]
+                            chunk_v = fast_v_buf[:, :self.lact_chunk_size, :]
+                            chunk_lr0 = lr0_buf[:, :self.lact_chunk_size, :]
+                            chunk_lr1 = lr1_buf[:, :self.lact_chunk_size, :]
+                            chunk_lr2 = lr2_buf[:, :self.lact_chunk_size, :]
+                            
+                            cur_w0, cur_w1, cur_w2 = ttt_update_step_isolated(
+                                chunk_k, chunk_v, cur_w0, cur_w1, cur_w2,
+                                chunk_lr0, chunk_lr1, chunk_lr2,
+                                w0_norm, w1_norm, w2_norm,
+                                use_muon=self.use_muon
+                            )
+                            
+                            # Remove used tokens from buffer
+                            fast_k_buf = fast_k_buf[:, self.lact_chunk_size:, :]
+                            fast_v_buf = fast_v_buf[:, self.lact_chunk_size:, :]
+                            lr0_buf = lr0_buf[:, self.lact_chunk_size:, :]
+                            lr1_buf = lr1_buf[:, self.lact_chunk_size:, :]
+                            lr2_buf = lr2_buf[:, self.lact_chunk_size:, :]
+                            pending_count -= self.lact_chunk_size
+                    else:
+                        # Last chunk: calculate remainder and buffer it
+                        # total_seen = seen_tokens + q_len (seen_tokens is from cache, already includes prior chunks)
+                        total_seen = seen_tokens + q_len
+                        remainder = total_seen % self.lact_chunk_size
+                        if remainder > 0:
+                            # Buffer the last 'remainder' tokens from current chunk
+                            fast_k_buf = fast_k[:, -remainder:, :]
+                            fast_v_buf = fast_v[:, -remainder:, :]
+                            lr0_buf = fw_lr1[:, -remainder:, :]
+                            lr1_buf = fw_lr2[:, -remainder:, :]
+                            lr2_buf = fw_lr3[:, -remainder:, :]
+                            pending_count = remainder
+                        else:
+                            # No remainder, nothing to buffer
+                            pending_count = 0
+                            fast_k_buf = None
+                            fast_v_buf = None
+                            lr0_buf = None
+                            lr1_buf = None
+                            lr2_buf = None
+                else:
+                    # Regular (non-chunked) prefill: just buffer remainder tokens
+                    pending_count = q_len % self.lact_chunk_size
+                    if pending_count > 0:
+                        fast_k_buf = fast_k[:, -pending_count:, :]
+                        fast_v_buf = fast_v[:, -pending_count:, :]
+                        lr0_buf = fw_lr1[:, -pending_count:, :]
+                        lr1_buf = fw_lr2[:, -pending_count:, :]
+                        lr2_buf = fw_lr3[:, -pending_count:, :]
         else:
             # DECODING
             fw_x = ttt_apply_weights_only(fast_q, cur_w0, cur_w1, cur_w2)
@@ -602,9 +714,13 @@ class LaCTSWIGLULayer(nn.Module):
                 lr2_buf = lr2_buf[:, self.lact_chunk_size:, :]
                 pending_count -= self.lact_chunk_size
                 
-                w0_norm = self.w0.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                if self.w0_w2_low_rank > 0:
+                    w0_norm = self.w0().norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                    w2_norm = self.w2().norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                else:
+                    w0_norm = self.w0.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
+                    w2_norm = self.w2.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
                 w1_norm = self.w1.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
-                w2_norm = self.w2.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
                 
                 cur_w0, cur_w1, cur_w2 = ttt_update_step_isolated(
                     chunk_k, chunk_v, cur_w0, cur_w1, cur_w2,
@@ -631,8 +747,30 @@ class LaCTSWIGLULayer(nn.Module):
         next_cache = None
         if use_cache:
              # Track actual sequence position for correct RoPE in future decoding
-             new_seen_tokens = seen_tokens + q_len if is_decoding else q_len
-             next_cache = (k_cache, v_cache, cur_w0, cur_w1, cur_w2, torch.tensor([pending_count], device=k.device), fast_k_buf, fast_v_buf, lr0_buf, lr1_buf, lr2_buf, torch.tensor([new_seen_tokens], device=k.device))
+             # For chunked prefill, we need to accumulate seen_tokens
+             if is_chunked_prefill:
+                 new_seen_tokens = seen_tokens + q_len
+             elif is_decoding:
+                 new_seen_tokens = seen_tokens + q_len
+             else:
+                 # Regular prefill (first pass)
+                 new_seen_tokens = q_len
+             device = hidden_states.device
+             # Use .clone() on all cached tensors to ensure independent copies
+             next_cache = (
+                 k_cache.clone() if k_cache is not None else None,
+                 v_cache.clone() if v_cache is not None else None,
+                 cur_w0.clone(),
+                 cur_w1.clone(),
+                 cur_w2.clone(),
+                 torch.tensor([pending_count], device=device),
+                 fast_k_buf.clone() if fast_k_buf is not None else None,
+                 fast_v_buf.clone() if fast_v_buf is not None else None,
+                 lr0_buf.clone() if lr0_buf is not None else None,
+                 lr1_buf.clone() if lr1_buf is not None else None,
+                 lr2_buf.clone() if lr2_buf is not None else None,
+                 torch.tensor([new_seen_tokens], device=device)
+             )
 
         return o, attentions, next_cache
 
@@ -658,7 +796,7 @@ class LaCTSWIGLULayer(nn.Module):
             indices_q = cu_seqlens_q[:-1]
             q = q.squeeze(1)
         else:
-            print("problematic")
+            # print("problematic")
             # The -q_len: slice assumes left padding.
             attention_mask = attention_mask[:, -q_len:]
             q, indices_q, cu_seqlens_q, max_seqlen_q, *_ = unpad_input(q, attention_mask)

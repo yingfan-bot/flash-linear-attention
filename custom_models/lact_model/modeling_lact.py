@@ -235,6 +235,13 @@ class LaCTModel(LaCTPreTrainedModel):
         return_dict: Optional[bool] = None,
         **kwargs: Unpack[Any]
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        import time
+        
+        # Track overall forward timing for all cases
+        seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        
         if output_attentions:
             warnings.warn(
                 "`TransformerModel` does not support output attention weights now, so `output_attentions` is set to `False`."
@@ -254,6 +261,34 @@ class LaCTModel(LaCTPreTrainedModel):
         # if use_cache and not isinstance(past_key_values, Cache):
         #     past_key_values = Cache.from_legacy_cache(past_key_values)
 
+        # Determine sequence length without embedding yet
+        seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+        chunk_size = getattr(self.config, 'lact_chunk_size', 2048)
+        
+        # Use chunked prefill for long sequences to reduce peak memory
+        # Prefill detection: seq_len > 1 means it's prefill (decoding is always seq_len=1)
+        is_prefill = seq_len > 1
+        use_chunked_prefill = is_prefill and use_cache and seq_len > chunk_size
+        
+        # print(f"[DEBUG] seq_len={seq_len}, chunk_size={chunk_size}, is_prefill={is_prefill}, use_cache={use_cache}, use_chunked_prefill={use_chunked_prefill}", flush=True)
+        
+        if use_chunked_prefill:
+            result = self._chunked_prefill_forward(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                chunk_size=chunk_size,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs
+            )
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            forward_time = (end_time - start_time) * 1000  # Convert to ms
+            # print(f"Overall forward time (chunked prefill, {seq_len} tokens): {forward_time:.2f} ms")
+            return result
+
+        # Standard forward - embed here
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
 
@@ -302,7 +337,8 @@ class LaCTModel(LaCTPreTrainedModel):
             if use_cache:
                 if next_cache is None:
                     next_cache = ()
-                next_cache += (layer_outputs[2 if output_attentions else 1],)
+                cache_idx = 2 if output_attentions else 1
+                next_cache += (layer_outputs[cache_idx],)
 
             if output_attentions:
                 all_attns += (layer_outputs[1],)
@@ -314,10 +350,111 @@ class LaCTModel(LaCTPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_attns] if v is not None)
+            result = tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_attns] if v is not None)
+        else:
+            result = BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_attns
+            )
+        
+        # Log overall forward timing for all cases
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        forward_time = (end_time - start_time) * 1000  # Convert to ms
+        
+        if seq_len == 1:
+            pass  # print(f"Overall forward time (decoding): {forward_time:.2f} ms")
+        else:
+            pass  # print(f"Overall forward time (regular prefill, {seq_len} tokens): {forward_time:.2f} ms")
+        
+        return result
+
+    def _chunked_prefill_forward(
+        self,
+        input_ids: Optional[torch.Tensor],
+        inputs_embeds: Optional[torch.Tensor],
+        chunk_size: int,
+        output_attentions: bool,
+        output_hidden_states: bool,
+        return_dict: bool,
+        **kwargs
+    ):
+        """
+        Process long sequences chunk-by-chunk to reduce peak memory.
+        Each chunk is embedded and processed through all layers, updating TTT weights.
+        Only the last chunk's output is kept for generation.
+        """
+        import gc
+        
+        if input_ids is not None:
+            batch_size, seq_len = input_ids.shape
+        else:
+            batch_size, seq_len, _ = inputs_embeds.shape
+        
+        # Initialize cache for all layers
+        num_layers = len(self.layers)
+        next_cache = [None] * num_layers
+        
+        all_hidden_states = () if output_hidden_states else None
+        all_attns = () if output_attentions else None
+        
+        # Process chunks
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        # print(f"[CHUNKED PREFILL] seq_len={seq_len}, chunk_size={chunk_size}, num_chunks={num_chunks}")
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, seq_len)
+            
+            # Embed chunk by chunk to avoid O(seq_len) memory
+            if input_ids is not None:
+                chunk_ids = input_ids[:, start_idx:end_idx]
+                hidden_states = self.embeddings(chunk_ids)
+                del chunk_ids
+            else:
+                hidden_states = inputs_embeds[:, start_idx:end_idx, :].clone()
+            
+            # Process through all layers
+            is_last_chunk = (chunk_idx == num_chunks - 1)
+            for layer_idx, layer in enumerate(self.layers):
+                past_key_value = next_cache[layer_idx]
+                
+                layer_outputs = layer(
+                    hidden_states,
+                    attention_mask=None,  # TTT doesn't need attention mask
+                    past_key_values=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=True,
+                    is_chunked_prefill=True,  # Tell layer to use prefill path
+                    is_last_chunk=is_last_chunk,  # Don't update weights on last chunk
+                    **kwargs
+                )
+                
+                hidden_states = layer_outputs[0]
+                cache_idx = 2 if output_attentions else 1
+                next_cache[layer_idx] = layer_outputs[cache_idx]
+                
+                if output_attentions and chunk_idx == num_chunks - 1:
+                    all_attns += (layer_outputs[1],)
+            
+            # Only keep last chunk's hidden states
+            if chunk_idx == num_chunks - 1:
+                final_hidden_states = self.norm(hidden_states)
+                if output_hidden_states:
+                    all_hidden_states += (final_hidden_states,)
+            
+            # print(f"[CHUNKED PREFILL] chunk {chunk_idx+1}/{num_chunks} done, allocated={torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        
+        # Convert cache list to tuple
+        next_cache = tuple(next_cache)
+        
+        if not return_dict:
+            return tuple(v for v in [final_hidden_states, next_cache, all_hidden_states, all_attns] if v is not None)
 
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+            last_hidden_state=final_hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_attns

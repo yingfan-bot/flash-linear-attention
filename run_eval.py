@@ -112,6 +112,7 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
        "--batch_size", "1",
        "--show_config",
        "--trust_remote_code",
+    #    "--limit", "50"
    ]
    
    print(f"🚀 Debug Mode: Running in-process with args: {sys.argv}")

@@ -86,13 +86,8 @@ class TransformerBlock(GradientCheckpointingLayer):
         use_cache: bool | None = False,
         **kwargs: Unpack[Any],
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
-        t0 = time.perf_counter()
-        
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
-        
-        t1 = time.perf_counter()
-        torch.cuda.synchronize()
         
         hidden_states, attentions, past_key_values = self.attn(
             hidden_states=hidden_states,
@@ -103,10 +98,6 @@ class TransformerBlock(GradientCheckpointingLayer):
             **kwargs,
         )
         
-        t2 = time.perf_counter()
-        torch.cuda.synchronize()
-        _log_timing(f"[Timing Layer {self.layer_idx}] Flash Attention: {(t2-t1)*1000:.2f} ms", color_code=92)
-        
         if self.config.fuse_norm:
             hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
         else:
@@ -114,16 +105,8 @@ class TransformerBlock(GradientCheckpointingLayer):
             residual = hidden_states
             hidden_states = self.mlp_norm(hidden_states)
         
-        t3 = time.perf_counter()
-        torch.cuda.synchronize()
-        
         hidden_states = self.mlp(hidden_states, **kwargs)
         hidden_states = residual + hidden_states
-        
-        t4 = time.perf_counter()
-        torch.cuda.synchronize()
-        _log_timing(f"[Timing Layer {self.layer_idx}] MLP (SwiGLU): {(t4-t3)*1000:.2f} ms", color_code=95)
-        _log_timing(f"[Timing Layer {self.layer_idx}] Total layer time: {(t4-t0)*1000:.2f} ms", color_code=93)
 
         outputs = (hidden_states,)
 
@@ -344,6 +327,9 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
 
         t0 = time.perf_counter()
         
+        # Determine sequence length for prefill/decoding distinction
+        seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+        
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -358,7 +344,12 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
 
         t1 = time.perf_counter()
         torch.cuda.synchronize()
-        _log_timing(f"[Timing Model] Model forward (all layers): {(t1-t0)*1000:.2f} ms", color_code=96)
+        
+        # Add prefill/decoding distinction to timing
+        if seq_len == 1:
+            _log_timing(f"[Timing Model] Model forward (decoding): {(t1-t0)*1000:.2f} ms", color_code=96)
+        else:
+            _log_timing(f"[Timing Model] Model forward (prefill, {seq_len} tokens): {(t1-t0)*1000:.2f} ms", color_code=96)
         
         hidden_states = outputs[0]
 
