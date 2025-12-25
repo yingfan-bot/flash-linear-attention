@@ -1,6 +1,21 @@
 import torch.nn.functional as F
 import torch
 
+# Debug mode flag - set to True to enable intermediate output logging
+# Usage: import custom_models.lact_model.ttt_operation as ttt_op; ttt_op.DEBUG_MODE = True
+DEBUG_MODE = False
+
+def debug_print(*args, **kwargs):
+    """Print only when DEBUG_MODE is True."""
+    if DEBUG_MODE:
+        print(*args, **kwargs)
+
+def debug_tensor(name, t):
+    """Print tensor stats when DEBUG_MODE is True."""
+    if DEBUG_MODE and t is not None:
+        print(f"  [DEBUG] {name}: shape={t.shape}, mean={t.float().mean():.6f}, "
+              f"std={t.float().std():.6f}, min={t.float().min():.6f}, max={t.float().max():.6f}")
+
 # @torch.compile()
 def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     """
@@ -81,6 +96,8 @@ def block_causal_lact_swiglu(
     use_muon: bool = False,
     momentum: torch.Tensor = None, # [b, s, 1]
     return_final_state: bool = False,
+    update_last_chunk: bool = False,  # NEW: if True, also update weights for the last/remainder chunk
+    momentum_state: tuple = None,  # NEW: (dw0_momentum, dw1_momentum, dw2_momentum) for chunked prefill
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -102,6 +119,19 @@ def block_causal_lact_swiglu(
         Total: 18 * D * H * L * B
     Outputs:
         o: [b, l, dv]
+        If return_final_state is True and momentum is not None:
+            Returns: (output, (w0, w1, w2), (dw0_momentum, dw1_momentum, dw2_momentum))
+        If return_final_state is True and momentum is None:
+            Returns: (output, (w0, w1, w2))
+        
+    Args:
+        update_last_chunk: If True, update weights even for the last (possibly partial) chunk.
+                          This is needed for chunked prefill where each chunk should contribute
+                          to weight updates for subsequent chunks. Default False preserves
+                          original behavior where remainder tokens don't update weights.
+        momentum_state: Optional tuple of (dw0_momentum, dw1_momentum, dw2_momentum) from 
+                       previous chunked prefill call. Used to maintain momentum continuity
+                       across chunked prefill calls.
     """
     
     # adding detach here sometimes improves stability.
@@ -110,9 +140,14 @@ def block_causal_lact_swiglu(
     w2_norm = w2.norm(dim=2, keepdim=True)
 
     if momentum is not None:
-        dw1_momentum = torch.zeros_like(w1)
-        dw0_momentum = torch.zeros_like(w0)
-        dw2_momentum = torch.zeros_like(w2)
+        if momentum_state is not None:
+            # Use provided momentum state from previous chunk
+            dw0_momentum, dw1_momentum, dw2_momentum = momentum_state
+        else:
+            # Initialize momentum to zeros
+            dw1_momentum = torch.zeros_like(w1)
+            dw0_momentum = torch.zeros_like(w0)
+            dw2_momentum = torch.zeros_like(w2)
 
     q = q.transpose(1, 2)  # [b, dk, l]
     v = v.transpose(1, 2)
@@ -121,9 +156,32 @@ def block_causal_lact_swiglu(
 
     e_index = 0
     seq_len = k.shape[1]
-    for i in range(0, seq_len - chunk_size, chunk_size):
+    
+    # [block_causal_lact_swiglu] Determine how many full chunks to process in the loop
+    # If update_last_chunk is True and seq_len is a multiple of chunk_size,
+    # we need to include the last chunk in the loop
+    if update_last_chunk and seq_len > 0 and seq_len % chunk_size == 0:
+        loop_end = seq_len
+    else:
+        loop_end = seq_len - chunk_size if seq_len > chunk_size else 0
+    
+    debug_print(f"[block_causal_lact_swiglu] seq_len={seq_len}, chunk_size={chunk_size}, "
+                f"update_last_chunk={update_last_chunk}, loop_end={loop_end}, "
+                f"momentum_state={'provided' if momentum_state is not None else 'None'}")
+    debug_print(f"  INPUT k: mean={k.float().mean():.6f}, max={k.float().abs().max():.6f}")
+    debug_print(f"  INPUT v: mean={v.float().mean():.6f}, max={v.float().abs().max():.6f}")
+    debug_print(f"  INPUT q: mean={q.float().mean():.6f}, max={q.float().abs().max():.6f}")
+    debug_print(f"  INPUT lr0: mean={lr0.float().mean():.6f}, max={lr0.float().abs().max():.6f}")
+    debug_print(f"  w0 initial: mean={w0.float().mean():.6f}, max={w0.float().abs().max():.6f}")
+    debug_print(f"  w1 initial: mean={w1.float().mean():.6f}, max={w1.float().abs().max():.6f}")
+    debug_print(f"  w2 initial: mean={w2.float().mean():.6f}, max={w2.float().abs().max():.6f}")
+    
+    chunk_idx = 0
+    for i in range(0, loop_end, chunk_size):
         s_index = i
         e_index = s_index + chunk_size
+        
+        debug_print(f"  [Chunk {chunk_idx}] range=[{s_index}:{e_index}]")
 
         # [b, l, dk]
         ki = k[:, s_index:e_index, :]  # bf16
@@ -172,6 +230,9 @@ def block_causal_lact_swiglu(
         if momentum is not None:
             m_i = momentum[:, s_index:e_index, :] 
             m_i = m_i.mean(dim=1, keepdim=True)
+            
+            debug_print(f"    [BEFORE mom] dw0 max={dw0.float().abs().max():.6f}, dw0_momentum max={dw0_momentum.float().abs().max():.6f}")
+            debug_print(f"    [BEFORE mom] m_i mean={m_i.float().mean():.6f}")
 
             dw0 = dw0 + dw0_momentum * m_i
             dw1 = dw1 + dw1_momentum * m_i
@@ -179,6 +240,7 @@ def block_causal_lact_swiglu(
             dw0_momentum = dw0
             dw1_momentum = dw1
             dw2_momentum = dw2
+            debug_print(f"    [AFTER mom] dw0_m max={dw0_momentum.float().abs().max():.6f}")
 
 
         if use_muon:
@@ -202,19 +264,85 @@ def block_causal_lact_swiglu(
         w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
         w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
         
-    # for the last chunk, don't update the fast weights, directly apply the fast weights to the query.
+        debug_print(f"    [Chunk {chunk_idx}] after update: w0 max={w0.float().abs().max():.6f}, w1 max={w1.float().abs().max():.6f}")
+        chunk_idx += 1
+        debug_tensor(f"  w2_iter{i//chunk_size}", w2)
+        debug_tensor(f"  output_chunk", output[:, :, s_index:e_index])
+        
+    # Handle the last (possibly partial) chunk
+    # Only process if there are remaining tokens after the loop
     s_index = e_index
     e_index = seq_len
+    
+    debug_print(f"  [Last chunk] s_index={s_index}, e_index={e_index}, update_last_chunk={update_last_chunk}")
+    
+    if s_index < e_index:
+        qi = q[:, :, s_index:e_index]
+        # use the last w0 and w1 to get the final output
+        # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
+        h = torch.bmm(w2, qi)
+        gate = F.silu(torch.bmm(w0, qi), inplace=True)
+        # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
+        output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
+        debug_print(f"    [Last chunk] output computed using w0 max={w0.float().abs().max():.6f}")
+        
+        # Optionally update weights for the last chunk (needed for chunked prefill)
+        if update_last_chunk and return_final_state:
+            debug_print(f"    [Last chunk] UPDATING weights (update_last_chunk=True)")
+            ki = k[:, s_index:e_index, :]
+            vi = v[:, :, s_index:e_index]
+            lr0i = lr0[:, s_index:e_index, :]
+            lr1i = lr1[:, s_index:e_index, :]
+            lr2i = lr2[:, s_index:e_index, :]
+            
+            gate_before_act = torch.bmm(w0, ki.transpose(1, 2))
+            hidden_before_mul = torch.bmm(w2, ki.transpose(1, 2))
+            hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+            
+            dhidden = torch.bmm(w1.transpose(1, 2), vi)
+            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+            dgate = dhidden * hidden_before_mul
+            dgate_before_act = silu_backprop(dgate, gate_before_act)
+            
+            dw1 = torch.bmm(vi, (hidden.transpose(1, 2) * lr1i).type_as(vi))
+            dw0 = torch.bmm(dgate_before_act, (ki * lr0i).type_as(dgate_before_act))
+            dw2 = torch.bmm(dhidden_before_mul, (ki * lr2i).type_as(dhidden_before_mul))
+            
+            if momentum is not None:
+                m_i = momentum[:, s_index:e_index, :].mean(dim=1, keepdim=True)
+                dw0 = dw0 + dw0_momentum * m_i
+                dw1 = dw1 + dw1_momentum * m_i
+                dw2 = dw2 + dw2_momentum * m_i
+                debug_print(f"    [Last chunk] momentum applied, m_i mean={m_i.float().mean():.6f}")
+            
+            if use_muon:
+                dw1 = zeropower_via_newtonschulz5(dw1)
+                dw0 = zeropower_via_newtonschulz5(dw0)
+                dw2 = zeropower_via_newtonschulz5(dw2)
+            
+            w1 = w1 + dw1
+            w0 = w0 + dw0
+            w2 = w2 + dw2
+            
+            w0 = w0 / (w0.norm(dim=2, keepdim=True) + 1e-5) * w0_norm
+            w1 = w1 / (w1.norm(dim=2, keepdim=True) + 1e-5) * w1_norm
+            w2 = w2 / (w2.norm(dim=2, keepdim=True) + 1e-5) * w2_norm
+            debug_print(f"    [Last chunk] after update: w0 max={w0.float().abs().max():.6f}")
+        else:
+            debug_print(f"    [Last chunk] NOT updating weights (update_last_chunk={update_last_chunk})")
+    else:
+        debug_print(f"  [Last chunk] NO remaining tokens (s_index={s_index} >= e_index={e_index})")
 
-    qi = q[:, :, s_index:e_index]
-    # use the last w0 and w1 to get the final output
-    # [b, dh, dk] @ [b, dk, l] -> [b, dh, l]
-    h = torch.bmm(w2, qi)
-    gate = F.silu(torch.bmm(w0, qi), inplace=True)
-    # [b, dv, dh] @ [b, dh, l] -> [b, dv, l] -> [b, l, dv]
-    output[:, :, s_index:e_index] = torch.bmm(w1, gate * h)
-
+    debug_print(f"  FINAL: w0 max={w0.float().abs().max():.6f}, w1 max={w1.float().abs().max():.6f}")
+    debug_tensor("w0_final", w0)
+    debug_tensor("w1_final", w1)
+    debug_tensor("w2_final", w2)
+    debug_tensor("output_final", output)
+    
     if return_final_state:
+        if momentum is not None:
+            # Return momentum state for chunked prefill continuity
+            return output.transpose(1, 2), (w0, w1, w2), (dw0_momentum, dw1_momentum, dw2_momentum)
         return output.transpose(1, 2), (w0, w1, w2)
     return output.transpose(1, 2)
 
@@ -234,6 +362,7 @@ def prenorm_block_causal_lact_swiglu(
     use_muon: bool = False,
     momentum: torch.Tensor = None, # [b, s, 1]
     return_final_state: bool = False,
+    update_last_chunk: bool = False,  # NEW: consistent with block_causal_lact_swiglu
 ):
     """
     Block causal LaCT with SwiGLU fast weight function.
@@ -255,6 +384,11 @@ def prenorm_block_causal_lact_swiglu(
         Total: 18 * D * H * L * B
     Outputs:
         o: [b, l, dv]
+        
+    Args:
+        update_last_chunk: If True, update weights even for the last (possibly partial) chunk.
+                          Note: prenorm version already updates on last chunk when return_final_state=True,
+                          this flag makes it consistent with block_causal_lact_swiglu.
     """
     
     # adding detach here sometimes improves stability.
@@ -276,7 +410,20 @@ def prenorm_block_causal_lact_swiglu(
 
     e_index = 0
     seq_len = k.shape[1]
-    for i in range(0, seq_len - chunk_size, chunk_size):
+    
+    # [prenorm_block_causal_lact_swiglu] Determine how many full chunks to process in the loop
+    # If update_last_chunk is True and seq_len is a multiple of chunk_size,
+    # we need to include the last chunk in the loop
+    if update_last_chunk and seq_len > 0 and seq_len % chunk_size == 0:
+        loop_end = seq_len
+    else:
+        loop_end = seq_len - chunk_size if seq_len > chunk_size else 0
+    
+    debug_print(f"[prenorm_block_causal_lact_swiglu] seq_len={seq_len}, chunk_size={chunk_size}, "
+                f"update_last_chunk={update_last_chunk}, loop_end={loop_end}")
+    debug_tensor("prenorm_w0_initial", w0)
+    
+    for i in range(0, loop_end, chunk_size):
         s_index = i
         e_index = s_index + chunk_size
 

@@ -233,6 +233,7 @@ class LaCTModel(LaCTPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        force_chunked_prefill: Optional[bool] = None,  # None=auto, True=force chunked, False=force non-chunked
         **kwargs: Unpack[Any]
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         import time
@@ -268,9 +269,22 @@ class LaCTModel(LaCTPreTrainedModel):
         # Use chunked prefill for long sequences to reduce peak memory
         # Prefill detection: seq_len > 1 means it's prefill (decoding is always seq_len=1)
         is_prefill = seq_len > 1
-        use_chunked_prefill = is_prefill and use_cache and seq_len > chunk_size
         
-        # print(f"[DEBUG] seq_len={seq_len}, chunk_size={chunk_size}, is_prefill={is_prefill}, use_cache={use_cache}, use_chunked_prefill={use_chunked_prefill}", flush=True)
+        # Hard-coded chunked prefill control (modify this directly)
+        # USE_CHUNKED_PREFILL: True = always chunk, False = never chunk, None = auto
+        USE_CHUNKED_PREFILL = True
+        
+        if force_chunked_prefill is not None:
+            # User explicitly controls chunked prefill via function arg (highest priority)
+            use_chunked_prefill = force_chunked_prefill and is_prefill and use_cache
+        elif USE_CHUNKED_PREFILL is not None:
+            # Hard-coded control (second priority)
+            use_chunked_prefill = USE_CHUNKED_PREFILL and is_prefill and use_cache
+        else:
+            # Auto: use chunked prefill when seq_len > chunk_size
+            use_chunked_prefill = is_prefill and use_cache and seq_len > chunk_size
+        
+        # print(f"[DEBUG] seq_len={seq_len}, chunk_size={chunk_size}, is_prefill={is_prefill}, use_cache={use_cache}, force_chunked_prefill={force_chunked_prefill}, use_chunked_prefill={use_chunked_prefill}", flush=True)
         
         if use_chunked_prefill:
             result = self._chunked_prefill_forward(
@@ -569,6 +583,7 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         logits_to_keep: Optional[int] = 0,
+        force_chunked_prefill: Optional[bool] = None,  # None=auto, True=force chunked, False=force non-chunked
         **kwargs: Unpack[Any]
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -586,6 +601,7 @@ class LaCTForCausalLM(LaCTPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            force_chunked_prefill=force_chunked_prefill,
             **kwargs
         )
 

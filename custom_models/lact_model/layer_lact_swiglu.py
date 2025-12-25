@@ -24,6 +24,9 @@ from .ttt_operation import (
     block_causal_lact_swiglu_csdm_vec,
     ttt_apply_weights_only,
     ttt_update_step_isolated,
+    DEBUG_MODE,  # Import debug flag
+    debug_print,  # Import debug function
+    debug_tensor,  # Import debug tensor function
 )
 
 try:
@@ -342,6 +345,15 @@ class LaCTSWIGLULayer(nn.Module):
                  lr2_buf = past_key_values[10]
                  seen_tokens = past_key_values[11].item()
                  
+                 # Momentum state (optional, for chunked prefill continuity)
+                 if len(past_key_values) >= 15:
+                     dw0_momentum = past_key_values[12]
+                     dw1_momentum = past_key_values[13]
+                     dw2_momentum = past_key_values[14]
+                     momentum_state = (dw0_momentum, dw1_momentum, dw2_momentum)
+                 else:
+                     momentum_state = None
+                 
                  is_decoding = True
         elif has_cache_content and is_chunked_prefill:
             # CHUNKED PREFILL: Unpack cache for TTT weights, but use prefill path
@@ -361,13 +373,28 @@ class LaCTSWIGLULayer(nn.Module):
                  lr2_buf = past_key_values[10]
                  seen_tokens = past_key_values[11].item()
                  
+                 # Momentum state (for chunked prefill continuity)
+                 if len(past_key_values) >= 15:
+                     dw0_momentum = past_key_values[12]
+                     dw1_momentum = past_key_values[13]
+                     dw2_momentum = past_key_values[14]
+                     momentum_state = (dw0_momentum, dw1_momentum, dw2_momentum)
+                 else:
+                     momentum_state = None
+                 
                  is_decoding = False  # Still use prefill path for TTT
         else:
             # PREFILL: cache is None or empty
             pending_count = q_len % self.lact_chunk_size
             is_decoding = False
+            momentum_state = None
         
         q, k, v = self.qkv(hidden_states).chunk(3, dim=-1)
+        if self.layer_idx == 0:
+            debug_print(f"  [QKV L0] hidden_states: mean={hidden_states.float().mean():.6f}, max={hidden_states.float().abs().max():.6f}")
+            debug_print(f"  [QKV L0] q: mean={q.float().mean():.6f}, max={q.float().abs().max():.6f}")
+            debug_print(f"  [QKV L0] k: mean={k.float().mean():.6f}, max={k.float().abs().max():.6f}")
+            debug_print(f"  [QKV L0] v: mean={v.float().mean():.6f}, max={v.float().abs().max():.6f}")
         #### compute window attention first, then do ttt. ####
 
         if self.attn_qk_norm:
@@ -387,6 +414,7 @@ class LaCTSWIGLULayer(nn.Module):
 
         seqlen_offset = seen_tokens  # Always use seen_tokens (0 for prefill, actual position for decoding)
         max_seqlen = q.shape[1] + seqlen_offset
+        debug_print(f"  [ROPE] seqlen_offset={seqlen_offset}, q.shape[1]={q.shape[1]}, max_seqlen={max_seqlen}")
         if attention_mask is not None:
              # to deliminate the offsets of padding tokens
              seqlen_offset = seqlen_offset + attention_mask.sum(-1) - attention_mask.shape[-1]
@@ -508,16 +536,18 @@ class LaCTSWIGLULayer(nn.Module):
             fast_k = rearrange(fast_k, 'b s (n_h d) -> (b n_h) s d', n_h=self.num_fw_heads)
             #### RoPE done. ####
 
-        lr = self.lr_proj(hidden_states) # [b, s, num_heads * lr_dim_per_head]
+        # Use native dtype for lr_proj
+        lr = self.lr_proj(hidden_states)
         if self.lr_parameterization == "mamba":
-            lr = torch.nn.functional.softplus(lr.float() + self.base_lr_inv)
+            lr = torch.nn.functional.softplus(lr + self.base_lr_inv)
         else:
             raise NotImplementedError(f"LR parameterization {self.lr_parameterization} not implemented")
         fw_lr = rearrange(lr, 'b s (n_h lr_dim) -> (b n_h) s lr_dim', n_h=self.num_fw_heads)
         fw_lr1, fw_lr2, fw_lr3 = fw_lr.chunk(3, dim=-1)
 
         if self.use_momentum:
-            momentum = self.momentum_proj(hidden_states) # [b, s, nh]
+            # Use native dtype for momentum_proj
+            momentum = self.momentum_proj(hidden_states)
             momentum = rearrange(momentum, 'b s (n_h d) -> (b n_h) s d', n_h=self.num_fw_heads)
         else:
             momentum = None
@@ -526,6 +556,21 @@ class LaCTSWIGLULayer(nn.Module):
         
         if not is_decoding:
             # PREFILL
+            # For chunked prefill: update weights for all chunks EXCEPT the last one
+            # This matches non-chunked behavior where the last chunk doesn't update weights
+            # For regular (non-chunked) prefill: use update_last_chunk=False (original behavior)
+            should_update_last = is_chunked_prefill and not is_last_chunk
+            
+            debug_print(f"\n[Layer {self.layer_idx}] PREFILL mode, seq_len={q_len}")
+            debug_print(f"  is_chunked_prefill={is_chunked_prefill}, is_last_chunk={is_last_chunk}, should_update_last={should_update_last}")
+            debug_print(f"  lact_chunk_size={self.lact_chunk_size}, use_cache={use_cache}")
+            debug_tensor("fast_q", fast_q)
+            debug_tensor("fast_k", fast_k)
+            debug_tensor("fast_v", fast_v)
+            debug_tensor("cur_w0_before_ttt", cur_w0)
+            debug_tensor("cur_w1_before_ttt", cur_w1)
+            debug_tensor("cur_w2_before_ttt", cur_w2)
+            
             if self.num_slices >= 1:
                 # ... (CSDM logic) ...
                 # Note: CSDM doesn't support return_final_state yet in my edits, but I'll assume it does or fallback
@@ -578,79 +623,64 @@ class LaCTSWIGLULayer(nn.Module):
                 # If use_cache is True and CSDM is used, we are in trouble because I didn't update CSDM.
                 # I will assume standard path for now as per recipe.
             elif self.ttt_prenorm:
+                # Use native dtype (bf16) - momentum continuity is the key fix
                 fw_x = prenorm_block_causal_lact_swiglu(
-                    cur_w0, cur_w1, cur_w2, fast_q, fast_k, fast_v,
+                    cur_w0, cur_w1, cur_w2, 
+                    fast_q, fast_k, fast_v,
                     fw_lr1, fw_lr2, fw_lr3,
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
-                    return_final_state=use_cache)
+                    return_final_state=use_cache,
+                    update_last_chunk=should_update_last)
             else:
+                # Use native dtype (bf16) - momentum continuity is the key fix
+                # Pass momentum_state for chunked prefill continuity
                 fw_x = block_causal_lact_swiglu(
-                    cur_w0, cur_w1, cur_w2, fast_q, fast_k, fast_v,
+                    cur_w0, cur_w1, cur_w2, 
+                    fast_q, fast_k, fast_v,
                     fw_lr1, fw_lr2, fw_lr3,
                     chunk_size=self.lact_chunk_size,
                     use_muon=self.use_muon,
                     momentum=momentum,
-                    return_final_state=use_cache)
+                    return_final_state=use_cache,
+                    update_last_chunk=should_update_last,
+                    momentum_state=momentum_state if (is_chunked_prefill and self.use_momentum) else None)
+            
+            debug_print(f"[LaCTSWIGLULayer.forward] After TTT operation:")
+            debug_tensor("fw_x", fw_x if not isinstance(fw_x, tuple) else fw_x[0])
+            
+            # Handle the new return format that includes momentum state
+            # fw_x can be: output, (output, weights), or (output, weights, momentum_state)
+            new_momentum_state = None
+            if isinstance(fw_x, tuple):
+                if len(fw_x) == 3:
+                    # (output, weights, momentum_state)
+                    fw_x_out, final_state, new_momentum_state = fw_x
+                    fw_x = (fw_x_out, final_state)
+                # else: len(fw_x) == 2, already in (output, weights) format
             
             if use_cache:
                 if isinstance(fw_x, tuple):
                     fw_x, final_state = fw_x
                     cur_w0, cur_w1, cur_w2 = final_state
+                    debug_print(f"  Got final_state from TTT (weights updated)")
+                    debug_tensor("cur_w0_after_ttt", cur_w0)
+                    debug_tensor("cur_w1_after_ttt", cur_w1)
+                    debug_tensor("cur_w2_after_ttt", cur_w2)
                 
-                # For chunked prefill: accumulate tokens in buffer, update weights when we have a full chunk
-                # For last chunk: buffer only the remainder tokens (matching non-chunked behavior)
+                # Store momentum state for chunked prefill continuity
+                if is_chunked_prefill and not is_last_chunk and new_momentum_state is not None:
+                    momentum_state = new_momentum_state
+                else:
+                    momentum_state = None  # Reset for decoding or last chunk
+                
+                # Buffer handling for pending tokens (for decoding)
+                # With update_last_chunk, weight updates are handled inside block_causal_lact_swiglu
+                # We only need to track the remainder tokens for future decoding
                 
                 if is_chunked_prefill:
-                    if not is_last_chunk:
-                        # Only buffer tokens from non-last chunks
-                        if fast_k_buf is None:
-                            fast_k_buf = fast_k
-                            fast_v_buf = fast_v
-                            lr0_buf = fw_lr1
-                            lr1_buf = fw_lr2
-                            lr2_buf = fw_lr3
-                        else:
-                            fast_k_buf = torch.cat((fast_k_buf, fast_k), dim=1)
-                            fast_v_buf = torch.cat((fast_v_buf, fast_v), dim=1)
-                            lr0_buf = torch.cat((lr0_buf, fw_lr1), dim=1)
-                            lr1_buf = torch.cat((lr1_buf, fw_lr2), dim=1)
-                            lr2_buf = torch.cat((lr2_buf, fw_lr3), dim=1)
-                        
-                        pending_count = pending_count + q_len
-                        
-                        # Update weights when we have a full chunk
-                        if pending_count >= self.lact_chunk_size:
-                            if self.w0_w2_low_rank > 0:
-                                w0_norm = self.w0().norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
-                                w2_norm = self.w2().norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
-                            else:
-                                w0_norm = self.w0.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
-                                w2_norm = self.w2.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
-                            w1_norm = self.w1.norm(dim=2, keepdim=True).repeat(batch_size, 1, 1)
-                            
-                            chunk_k = fast_k_buf[:, :self.lact_chunk_size, :]
-                            chunk_v = fast_v_buf[:, :self.lact_chunk_size, :]
-                            chunk_lr0 = lr0_buf[:, :self.lact_chunk_size, :]
-                            chunk_lr1 = lr1_buf[:, :self.lact_chunk_size, :]
-                            chunk_lr2 = lr2_buf[:, :self.lact_chunk_size, :]
-                            
-                            cur_w0, cur_w1, cur_w2 = ttt_update_step_isolated(
-                                chunk_k, chunk_v, cur_w0, cur_w1, cur_w2,
-                                chunk_lr0, chunk_lr1, chunk_lr2,
-                                w0_norm, w1_norm, w2_norm,
-                                use_muon=self.use_muon
-                            )
-                            
-                            # Remove used tokens from buffer
-                            fast_k_buf = fast_k_buf[:, self.lact_chunk_size:, :]
-                            fast_v_buf = fast_v_buf[:, self.lact_chunk_size:, :]
-                            lr0_buf = lr0_buf[:, self.lact_chunk_size:, :]
-                            lr1_buf = lr1_buf[:, self.lact_chunk_size:, :]
-                            lr2_buf = lr2_buf[:, self.lact_chunk_size:, :]
-                            pending_count -= self.lact_chunk_size
-                    else:
+                    if is_last_chunk:
                         # Last chunk: calculate remainder and buffer it
                         # total_seen = seen_tokens + q_len (seen_tokens is from cache, already includes prior chunks)
                         total_seen = seen_tokens + q_len
@@ -671,6 +701,16 @@ class LaCTSWIGLULayer(nn.Module):
                             lr0_buf = None
                             lr1_buf = None
                             lr2_buf = None
+                    else:
+                        # Non-last chunks: weight update already happened in block_causal_lact_swiglu
+                        # with update_last_chunk=True. No buffering needed here since
+                        # the entire chunk was processed as "updateable"
+                        pending_count = 0
+                        fast_k_buf = None
+                        fast_v_buf = None
+                        lr0_buf = None
+                        lr1_buf = None
+                        lr2_buf = None
                 else:
                     # Regular (non-chunked) prefill: just buffer remainder tokens
                     pending_count = q_len % self.lact_chunk_size
@@ -683,6 +723,7 @@ class LaCTSWIGLULayer(nn.Module):
         else:
             # DECODING
             fw_x = ttt_apply_weights_only(fast_q, cur_w0, cur_w1, cur_w2)
+            new_momentum_state = None  # No momentum state update during decoding
             
             if fast_k_buf is None:
                 fast_k_buf = fast_k
@@ -769,7 +810,11 @@ class LaCTSWIGLULayer(nn.Module):
                  lr0_buf.clone() if lr0_buf is not None else None,
                  lr1_buf.clone() if lr1_buf is not None else None,
                  lr2_buf.clone() if lr2_buf is not None else None,
-                 torch.tensor([new_seen_tokens], device=device)
+                 torch.tensor([new_seen_tokens], device=device),
+                 # Momentum state for chunked prefill continuity (indices 12, 13, 14)
+                 new_momentum_state[0].clone() if new_momentum_state is not None else None,
+                 new_momentum_state[1].clone() if new_momentum_state is not None else None,
+                 new_momentum_state[2].clone() if new_momentum_state is not None else None,
              )
 
         return o, attentions, next_cache
