@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
@@ -25,6 +26,43 @@ from .layer_lact_swiglu import LaCTSWIGLULayer
 from .configuration_lact_swiglu import LaCTSWIGLUConfig
 
 logger = logging.get_logger(__name__)
+
+# Time profiling flag - set to True to enable timing logs
+# Usage: import custom_models.lact_model.modeling_lact as lact; lact.PROFILE_TIME = True
+PROFILE_TIME = True
+
+# Accumulated timing stats for averaging
+_timing_stats = {
+    'prefill_times': [],
+    'prefill_tokens': [],
+    'decode_times': [],
+    'decode_count': 0,
+}
+
+def reset_timing_stats():
+    """Reset accumulated timing statistics."""
+    global _timing_stats
+    _timing_stats = {
+        'prefill_times': [],
+        'prefill_tokens': [],
+        'decode_times': [],
+        'decode_count': 0,
+    }
+
+def get_timing_stats():
+    """Get timing statistics summary."""
+    stats = _timing_stats
+    result = {}
+    if stats['prefill_times']:
+        total_prefill = sum(stats['prefill_times'])
+        total_tokens = sum(stats['prefill_tokens'])
+        result['prefill_total_ms'] = total_prefill
+        result['prefill_total_tokens'] = total_tokens
+        result['prefill_ms_per_token'] = total_prefill / total_tokens if total_tokens > 0 else 0
+    if stats['decode_times']:
+        result['decode_avg_ms'] = sum(stats['decode_times']) / len(stats['decode_times'])
+        result['decode_count'] = stats['decode_count']
+    return result
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -236,12 +274,11 @@ class LaCTModel(LaCTPreTrainedModel):
         force_chunked_prefill: Optional[bool] = None,  # None=auto, True=force chunked, False=force non-chunked
         **kwargs: Unpack[Any]
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        import time
-        
         # Track overall forward timing for all cases
         seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
         
         if output_attentions:
             warnings.warn(
@@ -296,10 +333,13 @@ class LaCTModel(LaCTPreTrainedModel):
                 return_dict=return_dict,
                 **kwargs
             )
-            torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            forward_time = (end_time - start_time) * 1000  # Convert to ms
-            # print(f"Overall forward time (chunked prefill, {seq_len} tokens): {forward_time:.2f} ms")
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                end_time = time.perf_counter()
+                forward_time = (end_time - start_time) * 1000  # Convert to ms
+                _timing_stats['prefill_times'].append(forward_time)
+                _timing_stats['prefill_tokens'].append(seq_len)
+                print(f"[LaCT PROFILE] Chunked prefill: {seq_len} tokens, {forward_time:.2f} ms")
             return result
 
         # Standard forward - embed here
@@ -374,14 +414,19 @@ class LaCTModel(LaCTPreTrainedModel):
             )
         
         # Log overall forward timing for all cases
-        torch.cuda.synchronize()
-        end_time = time.perf_counter()
-        forward_time = (end_time - start_time) * 1000  # Convert to ms
-        
-        if seq_len == 1:
-            pass  # print(f"Overall forward time (decoding): {forward_time:.2f} ms")
-        else:
-            pass  # print(f"Overall forward time (regular prefill, {seq_len} tokens): {forward_time:.2f} ms")
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            forward_time = (end_time - start_time) * 1000  # Convert to ms
+            
+            if seq_len == 1:
+                _timing_stats['decode_times'].append(forward_time)
+                _timing_stats['decode_count'] += 1
+                print(f"[LaCT PROFILE] Decode: {forward_time:.2f} ms")
+            else:
+                _timing_stats['prefill_times'].append(forward_time)
+                _timing_stats['prefill_tokens'].append(seq_len)
+                print(f"[LaCT PROFILE] Regular prefill: {seq_len} tokens, {forward_time:.2f} ms")
         
         return result
 

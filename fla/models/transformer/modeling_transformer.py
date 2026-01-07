@@ -5,8 +5,6 @@ import math
 import warnings
 from typing import TYPE_CHECKING, Any
 import time
-import os
-from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -25,6 +23,42 @@ from fla.modules.l2warp import l2_warp
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
+# Time profiling flag - set to True to enable timing logs
+# Usage: import fla.models.transformer.modeling_transformer as tf; tf.PROFILE_TIME = True
+PROFILE_TIME = True
+
+# Accumulated timing stats for averaging
+_timing_stats = {
+    'prefill_times': [],
+    'prefill_tokens': [],
+    'decode_times': [],
+    'decode_count': 0,
+}
+
+def reset_timing_stats():
+    """Reset accumulated timing statistics."""
+    global _timing_stats
+    _timing_stats = {
+        'prefill_times': [],
+        'prefill_tokens': [],
+        'decode_times': [],
+        'decode_count': 0,
+    }
+
+def get_timing_stats():
+    """Get timing statistics summary."""
+    stats = _timing_stats
+    result = {}
+    if stats['prefill_times']:
+        total_prefill = sum(stats['prefill_times'])
+        total_tokens = sum(stats['prefill_tokens'])
+        result['prefill_total_ms'] = total_prefill
+        result['prefill_total_tokens'] = total_tokens
+        result['prefill_ms_per_token'] = total_prefill / total_tokens if total_tokens > 0 else 0
+    if stats['decode_times']:
+        result['decode_avg_ms'] = sum(stats['decode_times']) / len(stats['decode_times'])
+        result['decode_count'] = stats['decode_count']
+    return result
 
 try:
     from transformers.modeling_layers import GradientCheckpointingLayer
@@ -32,19 +66,6 @@ except ImportError:
     from fla.models.modeling_layers import GradientCheckpointingLayer
 
 logger = logging.get_logger(__name__)
-
-# Timing log file setup
-log_dir = os.path.expanduser("~/timing_logs")
-os.makedirs(log_dir, exist_ok=True)
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = os.path.join(log_dir, f"timing_{timestamp}.log")
-
-def _log_timing(message, color_code=93):
-    """Helper to log timing with color. Color codes: 96=cyan (model-level), 93=yellow (layer-level), 92=green (attention), 95=magenta (MLP)"""
-    colored_msg = f"\033[{color_code}m{message}\033[0m"
-    print(colored_msg)
-    with open(log_file, "a") as f:
-        f.write(colored_msg + "\n")
 
 
 class TransformerBlock(GradientCheckpointingLayer):
@@ -205,6 +226,12 @@ class TransformerModel(TransformerPreTrainedModel):
         return_dict: bool | None = None,
         **kwargs: Unpack[Any],
     ) -> tuple | CausalLMOutputWithPast:
+        # Track timing
+        seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+        
         if output_attentions:
             warnings.warn(
                 "`TransformerModel` does not support output attention weights now, so `output_attentions` is set to `False`.",
@@ -260,6 +287,21 @@ class TransformerModel(TransformerPreTrainedModel):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+
+        # Log timing
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            end_time = time.perf_counter()
+            forward_time = (end_time - start_time) * 1000  # Convert to ms
+            
+            if seq_len == 1:
+                _timing_stats['decode_times'].append(forward_time)
+                _timing_stats['decode_count'] += 1
+                print(f"[Transformer PROFILE] Decode: {forward_time:.2f} ms")
+            else:
+                _timing_stats['prefill_times'].append(forward_time)
+                _timing_stats['prefill_tokens'].append(seq_len)
+                print(f"[Transformer PROFILE] Prefill: {seq_len} tokens, {forward_time:.2f} ms")
 
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_attns] if v is not None)
@@ -325,8 +367,6 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        t0 = time.perf_counter()
-        
         # Determine sequence length for prefill/decoding distinction
         seq_len = input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
         
@@ -341,23 +381,10 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
             return_dict=return_dict,
             **kwargs,
         )
-
-        t1 = time.perf_counter()
-        torch.cuda.synchronize()
-        
-        # Add prefill/decoding distinction to timing
-        if seq_len == 1:
-            _log_timing(f"[Timing Model] Model forward (decoding): {(t1-t0)*1000:.2f} ms", color_code=96)
-        else:
-            _log_timing(f"[Timing Model] Model forward (prefill, {seq_len} tokens): {(t1-t0)*1000:.2f} ms", color_code=96)
         
         hidden_states = outputs[0]
 
-        t2 = time.perf_counter()
         logits = None if self.config.fuse_linear_cross_entropy else self.lm_head(hidden_states[:, -logits_to_keep:])
-        t3 = time.perf_counter()
-        torch.cuda.synchronize()
-        _log_timing(f"[Timing Model] LM head: {(t3-t2)*1000:.2f} ms", color_code=96)
 
         loss = None
         if labels is not None:
@@ -373,15 +400,11 @@ class TransformerForCausalLM(TransformerPreTrainedModel, FLAGenerationMixin):
             # Enable model parallelism
             labels = labels.to(hidden_states.device)
             labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
-            t4 = time.perf_counter()
             if self.config.fuse_linear_cross_entropy:
                 loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))
                 loss = l2_warp(loss, logits) if self.config.use_l2warp else loss
-            t5 = time.perf_counter()
-            torch.cuda.synchronize()
-            _log_timing(f"[Timing Model] Loss computation: {(t5-t4)*1000:.2f} ms", color_code=96)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
