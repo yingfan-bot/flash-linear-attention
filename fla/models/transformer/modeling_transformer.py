@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 # Time profiling flag - set to True to enable timing logs
 # Usage: import fla.models.transformer.modeling_transformer as tf; tf.PROFILE_TIME = True
-PROFILE_TIME = True
+PROFILE_TIME = False
 
 # Accumulated timing stats for averaging
 _timing_stats = {

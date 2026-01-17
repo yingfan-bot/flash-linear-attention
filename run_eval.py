@@ -40,6 +40,30 @@ def parse_args():
        "--niah_multivalue", action="store_true", help="Run niah_multivalue task"
    )
    parser.add_argument(
+       "--vt", action="store_true", help="Run Variable Tracking (ruler_vt) task"
+   )
+   parser.add_argument(
+       "--cwe", action="store_true", help="Run Common Words Extraction (ruler_cwe) task"
+   )
+   parser.add_argument(
+       "--fwe", action="store_true", help="Run Frequent Words Extraction (ruler_fwe) task"
+   )
+   parser.add_argument(
+       "--qa_squad", action="store_true", help="Run SQuAD QA (ruler_qa_squad) task"
+   )
+   parser.add_argument(
+       "--qa_hotpot", action="store_true", help="Run HotpotQA (ruler_qa_hotpot) task"
+   )
+   parser.add_argument(
+       "--niah_multikey_2", action="store_true", help="Run niah_multikey_2 task"
+   )
+   parser.add_argument(
+       "--niah_multikey_3", action="store_true", help="Run niah_multikey_3 task"
+   )
+   parser.add_argument(
+       "--all", action="store_true", help="Run all RULER tasks"
+   )
+   parser.add_argument(
        "--length",
        type=str,
        help='Comma-separated list of sequence lengths (e.g., "8192,16384")',
@@ -77,7 +101,7 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
        "--tasks",
        task_name,
        "--model_args",
-       f"pretrained={path},use_cache={use_cache},dtype=bfloat16,max_length={length + 256},trust_remote_code=True",
+       f"pretrained={path},use_cache={use_cache},dtype=bfloat16,max_length={length + 512},trust_remote_code=True",
        "--metadata",
        f'{{"max_seq_lengths":[{length}]}}',
        "--batch_size",
@@ -107,7 +131,7 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
        "evals.harness",
        "--output_path", output_dir,
        "--tasks", task_name,
-       "--model_args", f"pretrained={path},use_cache={use_cache},dtype=bfloat16,max_length={length + 256},trust_remote_code=True",
+       "--model_args", f"pretrained={path},use_cache={use_cache},dtype=bfloat16,max_length={length + 512},trust_remote_code=True",
        "--metadata", f'{{"max_seq_lengths":[{length}]}}',
        "--batch_size", "1",
        "--show_config",
@@ -124,23 +148,50 @@ def run_experiment(model_name: str, task_name: str, path: str, length: int, devi
 def main():
    args = parse_args()
 
+   # All available RULER tasks
+   ALL_TASKS = [
+       "niah_single_1", "niah_single_2", "niah_single_3",
+       "niah_multikey_1", "niah_multikey_2", "niah_multikey_3",
+       "niah_multiquery", "niah_multivalue",
+       "ruler_vt", "ruler_cwe", "ruler_fwe",
+       "ruler_qa_squad", "ruler_qa_hotpot"
+   ]
+
    # Get list of tasks to run
    tasks = []
-   if args.niah_single_1:
-       tasks.append("niah_single_1")
-   if args.niah_single_2:
-       tasks.append("niah_single_2")
-   if args.niah_single_3:
-       tasks.append("niah_single_3")
-   if args.niah_multikey_1:
-       tasks.append("niah_multikey_1")
-   if args.niah_multiquery:
-       tasks.append("niah_multiquery")
-   if args.niah_multivalue:
-       tasks.append("niah_multivalue")
+   if args.all:
+       tasks = ALL_TASKS
+   else:
+       if args.niah_single_1:
+           tasks.append("niah_single_1")
+       if args.niah_single_2:
+           tasks.append("niah_single_2")
+       if args.niah_single_3:
+           tasks.append("niah_single_3")
+       if args.niah_multikey_1:
+           tasks.append("niah_multikey_1")
+       if args.niah_multikey_2:
+           tasks.append("niah_multikey_2")
+       if args.niah_multikey_3:
+           tasks.append("niah_multikey_3")
+       if args.niah_multiquery:
+           tasks.append("niah_multiquery")
+       if args.niah_multivalue:
+           tasks.append("niah_multivalue")
+       if args.vt:
+           tasks.append("ruler_vt")
+       if args.cwe:
+           tasks.append("ruler_cwe")
+       if args.fwe:
+           tasks.append("ruler_fwe")
+       if args.qa_squad:
+           tasks.append("ruler_qa_squad")
+       if args.qa_hotpot:
+           tasks.append("ruler_qa_hotpot")
 
    if not tasks:
        print("No tasks specified. Please specify at least one task.")
+       print(f"Available tasks: {', '.join(ALL_TASKS)}")
        return
 
    # Parse lengths

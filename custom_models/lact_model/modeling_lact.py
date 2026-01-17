@@ -29,7 +29,7 @@ logger = logging.get_logger(__name__)
 
 # Time profiling flag - set to True to enable timing logs
 # Usage: import custom_models.lact_model.modeling_lact as lact; lact.PROFILE_TIME = True
-PROFILE_TIME = True
+PROFILE_TIME = False
 
 # Accumulated timing stats for averaging
 _timing_stats = {
@@ -309,7 +309,7 @@ class LaCTModel(LaCTPreTrainedModel):
         
         # Hard-coded chunked prefill control (modify this directly)
         # USE_CHUNKED_PREFILL: True = always chunk, False = never chunk, None = auto
-        USE_CHUNKED_PREFILL = True
+        USE_CHUNKED_PREFILL = False
         
         if force_chunked_prefill is not None:
             # User explicitly controls chunked prefill via function arg (highest priority)
